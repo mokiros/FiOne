@@ -15,19 +15,6 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 ]] --
-local bit = bit or bit32 or require('bit')
-
-if not table.create then if table.new then table.create = table.new else function table.create(_) return {} end end end
-
-if not table.unpack then table.unpack = unpack end
-
-if not table.pack then function table.pack(...) return {n = select('#', ...), ...} end end
-
-if not table.move then
-	function table.move(src, first, last, offset, dst)
-		for i = 0, last - first do dst[offset + i] = src[first + i] end
-	end
-end
 
 local lua_bc_to_state
 local lua_wrap_state
@@ -191,9 +178,9 @@ end
 -- float rd_flt_basic(byte f1..8)
 -- @f1..4 - The 4 bytes composing a little endian float
 local function rd_flt_basic(f1, f2, f3, f4)
-	local sign = (-1) ^ bit.rshift(f4, 7)
-	local exp = bit.rshift(f3, 7) + bit.lshift(bit.band(f4, 0x7F), 1)
-	local frac = f1 + bit.lshift(f2, 8) + bit.lshift(bit.band(f3, 0x7F), 16)
+	local sign = (-1) ^ bit32.rshift(f4, 7)
+	local exp = bit32.rshift(f3, 7) + bit32.lshift(bit32.band(f4, 0x7F), 1)
+	local frac = f1 + bit32.lshift(f2, 8) + bit32.lshift(bit32.band(f3, 0x7F), 16)
 	local normal = 1
 
 	if exp == 0 then
@@ -217,9 +204,9 @@ end
 -- double rd_dbl_basic(byte f1..8)
 -- @f1..8 - The 8 bytes composing a little endian double
 local function rd_dbl_basic(f1, f2, f3, f4, f5, f6, f7, f8)
-	local sign = (-1) ^ bit.rshift(f8, 7)
-	local exp = bit.lshift(bit.band(f8, 0x7F), 4) + bit.rshift(f7, 4)
-	local frac = bit.band(f7, 0x0F) * 2 ^ 48
+	local sign = (-1) ^ bit32.rshift(f8, 7)
+	local exp = bit32.lshift(bit32.band(f8, 0x7F), 4) + bit32.rshift(f7, 4)
+	local frac = bit32.band(f7, 0x0F) * 2 ^ 48
 	local normal = 1
 
 	frac = frac + (f6 * 2 ^ 40) + (f5 * 2 ^ 32) + (f4 * 2 ^ 24) + (f3 * 2 ^ 16) + (f2 * 2 ^ 8) + f1 -- help
@@ -349,30 +336,30 @@ local function stm_inst_list(S)
 
 	for i = 1, len do
 		local ins = S:s_ins()
-		local op = bit.band(ins, 0x3F)
+		local op = bit32.band(ins, 0x3F)
 		local args = OPCODE_T[op]
 		local mode = OPCODE_M[op]
-		local data = {value = ins, op = OPCODE_RM[op], A = bit.band(bit.rshift(ins, 6), 0xFF)}
+		local data = {value = ins, op = OPCODE_RM[op], A = bit32.band(bit32.rshift(ins, 6), 0xFF)}
 
 		if args == 'ABC' then
-			data.B = bit.band(bit.rshift(ins, 23), 0x1FF)
-			data.C = bit.band(bit.rshift(ins, 14), 0x1FF)
+			data.B = bit32.band(bit32.rshift(ins, 23), 0x1FF)
+			data.C = bit32.band(bit32.rshift(ins, 14), 0x1FF)
 			data.is_KB = mode.b == 'OpArgK' and data.B > 0xFF -- post process optimization
 			data.is_KC = mode.c == 'OpArgK' and data.C > 0xFF
 
 			if op == 10 then -- decode NEWTABLE array size, store it as constant value
-				local e = bit.band(bit.rshift(data.B, 3), 31)
+				local e = bit32.band(bit32.rshift(data.B, 3), 31)
 				if e == 0 then
 					data.const = data.B
 				else
-					data.const = bit.lshift(bit.band(data.B, 7) + 8, e - 1)
+					data.const = bit32.lshift(bit32.band(data.B, 7) + 8, e - 1)
 				end
 			end
 		elseif args == 'ABx' then
-			data.Bx = bit.band(bit.rshift(ins, 14), 0x3FFFF)
+			data.Bx = bit32.band(bit32.rshift(ins, 14), 0x3FFFF)
 			data.is_K = mode.b == 'OpArgK'
 		elseif args == 'AsBx' then
-			data.sBx = bit.band(bit.rshift(ins, 14), 0x3FFFF) - 131071
+			data.sBx = bit32.band(bit32.rshift(ins, 14), 0x3FFFF) - 131071
 		end
 
 		list[i] = data
@@ -465,7 +452,7 @@ function stm_lua_func(S, psrc)
 	stm_upval_list(S)
 
 	-- post process optimization
-	proto.needs_arg = bit.band(proto.is_vararg, 0x5) == 0x5
+	proto.needs_arg = bit32.band(proto.is_vararg, 0x5) == 0x5
 	for _, v in ipairs(proto.code) do
 		if v.is_K then
 			v.const = proto.const[v.Bx + 1] -- offset for 1 based index
