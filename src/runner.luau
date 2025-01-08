@@ -54,7 +54,7 @@ local function on_lua_error(failed: ErrorState, err)
 	local src = failed.source
 	local line = failed.lines[failed.pc - 1]
 
-	error(string.format("%s:%i: %s", src, line, err), 0)
+	error(string.format("%s:%i: %s", src or "FiOne VM", line or -1, err or "<unknown error>"), 0)
 end
 
 local function close_lua_upvalues(list: { Upvalue }, index: number)
