@@ -30,7 +30,7 @@ local OpArgK: Constants.OPCODE_M_OpArgK = "OpArgK"
 
 type PartialStream = {
 	index: number,
-	source: string,
+	source: buffer,
 }
 
 type Stream = PartialStream & {
@@ -69,200 +69,95 @@ export type Proto = {
 	needs_arg: boolean,
 }
 
--- int rd_int_basic(string src, int s, int e, int d)
--- @src - Source binary string
--- @s - Start index of a little endian integer
--- @e - End index of the integer
--- @d - Direction of the loop
-local function rd_int_basic(src: string, s: number, e: number, d: number): number
-	local num = 0
+local int_readers = {
+	little = {
+		[4] = function(S: PartialStream): number
+			local pos = S.index
+			S.index += 4
+			return buffer.readu32(S.source, pos)
+		end,
+		[8] = function(S: PartialStream): number
+			local pos = S.index
+			S.index += 8
+			local n1 = buffer.readu32(S.source, pos)
+			local n2 = buffer.readu32(S.source, pos + 4)
+			return n2 * 0xFFFFFFFF + n1
+		end,
+	},
+	big = {
+		[4] = function(S: PartialStream): number
+			local pos = S.index
+			S.index += 4
+			return bit32.byteswap(buffer.readu32(S.source, pos))
+		end,
+		[8] = function(S: PartialStream): number
+			local pos = S.index
+			S.index += 8
+			local n1 = bit32.byteswap(buffer.readu32(S.source, pos))
+			local n2 = bit32.byteswap(buffer.readu32(S.source, pos + 4))
+			return n2 * 0xFFFFFFFF + n1
+		end,
+	},
+}
 
-	-- if bb[l] > 127 then -- signed negative
-	-- 	num = num - 256 ^ l
-	-- 	bb[l] = bb[l] - 128
-	-- end
+local _swap_buffer = buffer.create(8)
+local float_readers = {
+	little = {
+		[4] = function(S: PartialStream): number
+			local pos = S.index
+			S.index += 4
+			return buffer.readf32(S.source, pos)
+		end,
+		[8] = function(S: PartialStream): number
+			local pos = S.index
+			S.index += 8
+			return buffer.readf64(S.source, pos)
+		end,
+	},
+	big = {
+		[4] = function(S: PartialStream): number
+			local pos = S.index
+			S.index += 4
 
-	for i = s, e, d do
-		local mul = 256 ^ math.abs(i - s)
+			local n = buffer.readu32(S.source, pos)
+			buffer.writeu32(_swap_buffer, 0, bit32.byteswap(n))
 
-		num = num + mul * string.byte(src, i, i)
-	end
+			return buffer.readf32(_swap_buffer, 0)
+		end,
+		[8] = function(S: PartialStream): number
+			local pos = S.index
+			S.index += 8
 
-	return num
-end
+			buffer.writeu32(_swap_buffer, 0, bit32.byteswap(buffer.readu32(S.source, pos + 4)))
+			buffer.writeu32(_swap_buffer, 4, bit32.byteswap(buffer.readu32(S.source, pos)))
 
--- float rd_flt_basic(byte f1..8)
--- @f1..4 - The 4 bytes composing a little endian float
-local function rd_flt_basic(f1: number, f2: number, f3: number, f4: number): number
-	local sign = (-1) ^ bit32.rshift(f4, 7)
-	local exp = bit32.rshift(f3, 7) + bit32.lshift(bit32.band(f4, 0x7F), 1)
-	local frac = f1 + bit32.lshift(f2, 8) + bit32.lshift(bit32.band(f3, 0x7F), 16)
-	local normal = 1
-
-	if exp == 0 then
-		if frac == 0 then
-			return sign * 0
-		else
-			normal = 0
-			exp = 1
-		end
-	elseif exp == 0x7F then
-		if frac == 0 then
-			return sign * (1 / 0)
-		else
-			return sign * (0 / 0)
-		end
-	end
-
-	return sign * 2 ^ (exp - 127) * (1 + normal / 2 ^ 23)
-end
-
--- double rd_dbl_basic(byte f1..8)
--- @f1..8 - The 8 bytes composing a little endian double
-local function rd_dbl_basic(
-	f1: number,
-	f2: number,
-	f3: number,
-	f4: number,
-	f5: number,
-	f6: number,
-	f7: number,
-	f8: number
-): number
-	local sign = (-1) ^ bit32.rshift(f8, 7)
-	local exp = bit32.lshift(bit32.band(f8, 0x7F), 4) + bit32.rshift(f7, 4)
-	local frac = bit32.band(f7, 0x0F) * 2 ^ 48
-	local normal = 1
-
-	frac = frac + (f6 * 2 ^ 40) + (f5 * 2 ^ 32) + (f4 * 2 ^ 24) + (f3 * 2 ^ 16) + (f2 * 2 ^ 8) + f1 -- help
-
-	if exp == 0 then
-		if frac == 0 then
-			return sign * 0
-		else
-			normal = 0
-			exp = 1
-		end
-	elseif exp == 0x7FF then
-		if frac == 0 then
-			return sign * (1 / 0)
-		else
-			return sign * (0 / 0)
-		end
-	end
-
-	return sign * 2 ^ (exp - 1023) * (normal + frac / 2 ^ 52)
-end
-
--- int rd_int_le(string src, int s, int e)
--- @src - Source binary string
--- @s - Start index of a little endian integer
--- @e - End index of the integer
-local function rd_int_le(src: string, s: number, e: number): number
-	return rd_int_basic(src, s, e - 1, 1)
-end
-
--- int rd_int_be(string src, int s, int e)
--- @src - Source binary string
--- @s - Start index of a big endian integer
--- @e - End index of the integer
-local function rd_int_be(src: string, s: number, e: number): number
-	return rd_int_basic(src, e - 1, s, -1)
-end
-
--- float rd_flt_le(string src, int s)
--- @src - Source binary string
--- @s - Start index of little endian float
-local function rd_flt_le(src: string, s: number): number
-	return rd_flt_basic(string.byte(src, s, s + 3))
-end
-
--- float rd_flt_be(string src, int s)
--- @src - Source binary string
--- @s - Start index of big endian float
-local function rd_flt_be(src: string, s: number): number
-	local f1, f2, f3, f4 = string.byte(src, s, s + 3)
-	return rd_flt_basic(f4, f3, f2, f1)
-end
-
--- double rd_dbl_le(string src, int s)
--- @src - Source binary string
--- @s - Start index of little endian double
-local function rd_dbl_le(src: string, s: number): number
-	return rd_dbl_basic(string.byte(src, s, s + 7))
-end
-
--- double rd_dbl_be(string src, int s)
--- @src - Source binary string
--- @s - Start index of big endian double
-local function rd_dbl_be(src: string, s: number): number
-	local f1, f2, f3, f4, f5, f6, f7, f8 = string.byte(src, s, s + 7) -- same
-	return rd_dbl_basic(f8, f7, f6, f5, f4, f3, f2, f1)
-end
-
--- to avoid nested ifs in deserializing
-local float_types = {
-	[4] = { little = rd_flt_le, big = rd_flt_be },
-	[8] = { little = rd_dbl_le, big = rd_dbl_be },
+			return buffer.readf64(_swap_buffer, 0)
+		end,
+	},
 }
 
 -- byte stm_byte(Stream S)
 -- @S - Stream object to read from
 local function stm_byte(S: PartialStream): number
 	local idx = S.index
-	local bt = string.byte(S.source, idx, idx)
-
 	S.index = idx + 1
-	return bt
-end
 
--- string stm_string(Stream S, int len)
--- @S - Stream object to read from
--- @len - Length of string being read
-local function stm_string(S: PartialStream, len: number): string
-	local pos = S.index + len
-	local str = string.sub(S.source, S.index, pos - 1)
-
-	S.index = pos
-	return str
+	return buffer.readu8(S.source, idx)
 end
 
 -- string stm_lstring(Stream S)
 -- @S - Stream object to read from
 local function stm_lstring(S: Stream): string
 	local len = S:s_szt()
-	local str
+	local str = ""
 
 	if len ~= 0 then
-		str = string.sub(stm_string(S, len), 1, -2)
+		local pos = S.index
+		str = buffer.readstring(S.source, pos, len - 1)
+		S.index = pos + len
 	end
 
 	return str
-end
-
--- fn cst_int_rdr(string src, int len, fn func)
--- @len - Length of type for reader
--- @func - Reader callback
-local function cst_int_rdr(len: number, func: (src: string, s: number, e: number) -> number)
-	return function(S: PartialStream)
-		local pos = S.index + len
-		local int = func(S.source, S.index, pos)
-		S.index = pos
-
-		return int
-	end
-end
-
--- fn cst_flt_rdr(string src, int len, fn func)
--- @len - Length of type for reader
--- @func - Reader callback
-local function cst_flt_rdr(len: number, func: (src: string, s: number) -> number)
-	return function(S: PartialStream)
-		local flt = func(S.source, S.index)
-		S.index = S.index + len
-
-		return flt
-	end
 end
 
 local function stm_inst_list(S: Stream): { Instruction }
@@ -411,7 +306,7 @@ function stm_lua_func(S: Stream, psrc: string): Proto
 	return proto
 end
 
-function lua_bc_to_state(src: string)
+function lua_bc_to_state(src: buffer)
 	-- header flags
 	local little
 	local size_int
@@ -423,11 +318,11 @@ function lua_bc_to_state(src: string)
 	-- stream object
 	local stream: PartialStream = {
 		-- data
-		index = 1,
+		index = 0,
 		source = src,
 	}
 
-	assert(stm_string(stream, 4) == "\27Lua", "invalid Lua signature")
+	assert(int_readers["little"][4](stream) == 0x61754c1b, "invalid Lua signature")
 	assert(stm_byte(stream) == 0x51, "invalid Lua version")
 	assert(stm_byte(stream) == 0, "invalid Lua format")
 
@@ -438,21 +333,17 @@ function lua_bc_to_state(src: string)
 	size_num = stm_byte(stream)
 	flag_int = stm_byte(stream) ~= 0
 
-	local rdr_func = little and rd_int_le or rd_int_be
+	local rdr_func = little and "little" or "big"
 
 	local full_stream: Stream = {
 		index = stream.index,
 		source = stream.source,
-		s_int = cst_int_rdr(size_int, rdr_func),
-		s_szt = cst_int_rdr(size_szt, rdr_func),
-		s_ins = cst_int_rdr(size_ins, rdr_func),
+		s_int = assert(int_readers[rdr_func][size_int], `Invalid int size: {size_int}`),
+		s_szt = assert(int_readers[rdr_func][size_szt], `Invalid int size: {size_szt}`),
+		s_ins = assert(int_readers[rdr_func][size_ins], `Invalid int size: {size_ins}`),
 		s_num = if flag_int
-			then cst_int_rdr(size_num, rdr_func)
-			elseif float_types[size_num] then cst_flt_rdr(
-				size_num,
-				float_types[size_num][little and "little" or "big"]
-			)
-			else error("unsupported float size"),
+			then assert(int_readers[rdr_func][size_num], `Invalid int size: {size_num}`)
+			else assert(float_readers[rdr_func][size_num], `Invalid float size: {size_num}`),
 	}
 
 	return stm_lua_func(full_stream, "@virtual")
