@@ -21,9 +21,12 @@ local Constants = require("./constants")
 local parser = require("./parser")
 local runner = require("./runner")
 
+export type FiOneState = runner.FiOneState
+
 return {
 	bc_to_state = parser.lua_bc_to_state,
-	wrap_state = runner.lua_wrap_state,
+	create_state = runner.create_fione_state,
+	step_state = runner.step_lua_func,
 	OPCODE_RM = Constants.OPCODE_RM,
 	OPCODE_T = Constants.OPCODE_T,
 	OPCODE_M = Constants.OPCODE_M,
