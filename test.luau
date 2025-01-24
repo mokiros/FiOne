@@ -3,73 +3,55 @@ local fione = require("./src")
 
 local bc = compile(
 	[[
-function a()
-	local id = fork()
-	print("Hello from " .. tostring(id))
+-- Successful pcall
+do
+	local success, msg, stack_trace = pcall(function()
+		return "Hello, "
+	end)
+
+	print("First call: " .. (success and "Success" or "Fail") .. ";", "Returned:", msg)
+	if not success then
+		print("Stack trace:")
+		print(stack_trace)
+	end
 end
 
-a()
+-- pcall with error
+do
+	local success, msg, stack_trace = pcall(function()
+		return "World!" .. nil
+	end)
+
+	print("Second call: " .. (success and "Success" or "Fail") .. ";", "Returned:", msg)
+	if not success then
+		print("Stack trace:")
+		print(stack_trace)
+	end
+end
+
+-- pcall stack test, should print 4 `true`
+print(pcall(pcall, pcall, pcall, function() return "pcall stack test" end))
+
+-- these values should get printed by the runner below
+return 1, 2, 3, "test"
 ]],
 	"hello.lua"
 )
 
 local proto = fione.bc_to_state(buffer.fromstring(bc))
-local state = fione.create_state(proto, { print = print, tostring = tostring })
+local state = fione.create_state(proto, { print = print, tostring = tostring, error = error })
 
 local states = { state }
-local stateIds = {
-	[state] = 1,
-}
-local nextId = 2
-local currentState: fione.FiOneState
-
-local function deepCopy(original)
-	local copy = {}
-
-	for key, value in original do
-		copy[key] = type(value) == "table" and deepCopy(value) or value
-	end
-
-	return copy
-end
-
-function state.env.fork()
-	local new_state: fione.FiOneState = {
-		env = table.clone(currentState.env),
-		stack_level = currentState.stack_level,
-		stack = table.create(#currentState.stack),
-	}
-
-	for i, s in currentState.stack do
-		local sc = table.clone(s)
-		sc.memory = deepCopy(sc.memory)
-		sc.open_list = deepCopy(sc.open_list)
-		sc.upvals = deepCopy(sc.upvals)
-		new_state.stack[i] = sc
-	end
-
-	local last_state = new_state.stack[new_state.stack_level]
-	local A = last_state.prev_A
-
-	last_state.memory[A] = nextId
-
-	last_state.pc += 1
-
-	table.insert(states, new_state)
-	stateIds[new_state] = nextId
-	nextId += 1
-
-	return stateIds[currentState]
-end
 
 while #states > 0 do
 	local n = #states
 	local i = 1
 	while i <= n do
 		local s = states[i]
-		currentState = s
 		fione.step_state(s)
-		if s.returned then
+		if s.stack_level == 0 then
+			print(`State {i} finished`)
+			print("Returned values:", s.stack[0].memory)
 			table.remove(states, i)
 			n -= 1
 		else

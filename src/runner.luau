@@ -33,25 +33,37 @@ export type Upvalue = {
 	value: any,
 }
 
-export type LuaState = {
-	is_tailcall: boolean,
-	prev_A: number,
-	prev_C: number,
-	vararg: VarArg,
+export type BaseState = {
 	memory: { any },
+}
+
+export type LuaState = BaseState & {
+	external: false,
+	is_tailcall: boolean,
+	vararg: VarArg,
 	top_index: number,
 	upvals: { Upvalue },
 	open_list: { Upvalue },
+	lines: { [number]: number },
 	code: { parser.Instruction },
 	subs: { parser.Proto },
 	pc: number,
 }
 
+export type PcallState = BaseState & {
+	external: true,
+	is_pcall: true,
+}
+
+export type StackState = LuaState | PcallState
+
 export type FiOneState = {
-	env: { [string]: any },
+	source: string,
+	env: any,
+	closure_protos: { [any]: parser.Proto },
+	closure_upvals: { [any]: { Upvalue }? },
 	stack_level: number,
-	stack: { LuaState },
-	returned: { any }?,
+	stack: { StackState },
 }
 
 export type ErrorState = {
@@ -63,7 +75,19 @@ export type ErrorState = {
 -- SETLIST config
 local FIELDS_PER_FLUSH = 50
 
-local CLOSURES = setmetatable({} :: { [any]: { upvals: { Upvalue }, proto: parser.Proto } }, { __mode = "k" })
+local last_running_state: FiOneState
+
+local BASE_ENV = table.freeze({
+	type = function(v: any): string
+		if last_running_state.closure_protos[v] then
+			return "function"
+		end
+		return type(v)
+	end,
+	pcall = function()
+		-- handled in `push_stack` function
+	end,
+})
 
 local function close_lua_upvalues(list: { Upvalue }, index: number)
 	for i, uv in pairs(list) do
@@ -89,9 +113,8 @@ end
 
 local function create_lua_state(proto: parser.Proto, upvals: { Upvalue }): LuaState
 	return {
+		external = false :: false,
 		is_tailcall = false,
-		prev_A = 0,
-		prev_C = 0,
 		num_param = proto.num_param,
 		needs_arg = proto.needs_arg,
 		upvals = upvals,
@@ -99,20 +122,76 @@ local function create_lua_state(proto: parser.Proto, upvals: { Upvalue }): LuaSt
 		open_list = {},
 		vararg = { len = 0, list = {} },
 		memory = table.create(proto.max_stack),
+		lines = proto.lines,
 		code = proto.code,
 		subs = proto.subs,
 		pc = 1,
 	}
 end
 
+local function pop_stack(global_state: FiOneState, ret_list: { any }, i: number, j: number, ret_list_mutable: boolean)
+	local stack_level = global_state.stack_level
+	local last_state = global_state.stack[stack_level]
+
+	local ret_offset = j - i
+
+	while last_state.external or last_state.is_tailcall do
+		if last_state.external and last_state.is_pcall then
+			if not ret_list_mutable then
+				local new_ret_list = table.create(ret_offset + 1)
+				new_ret_list[1] = true
+				table.move(ret_list, i, j, 2, new_ret_list)
+				ret_offset += 1
+				i = 1
+				j = ret_offset + 1
+				ret_list = new_ret_list
+				ret_list_mutable = true
+			else
+				table.insert(ret_list, i, true)
+				j += 1
+				ret_offset += 1
+			end
+		end
+		global_state.stack[stack_level] = nil
+		last_state = global_state.stack[stack_level - 1]
+		stack_level -= 1
+		global_state.stack_level = stack_level
+	end
+
+	local state = last_state :: LuaState
+	local memory = state.memory
+
+	local inst = state.code[state.pc]
+	local A = inst.A
+	local C = inst.C
+
+	if C == 0 then
+		state.top_index = A + ret_offset
+	else
+		ret_offset = C - 1
+	end
+
+	if not ret_list_mutable and i + ret_offset > j then
+		local n = j - i
+		for idx = 1, i + ret_offset - j do
+			memory[A + n + idx] = nil
+		end
+		table.move(ret_list, i, j, A, memory)
+	else
+		table.move(ret_list, i, i + ret_offset, A, memory)
+	end
+
+	state.pc += 1
+end
+
 local function push_stack(global_state: FiOneState, callable: any, i: number, j: number)
 	local stack_level = global_state.stack_level
 	local last_state = global_state.stack[stack_level]
 
-	if typeof(callable) == "userdata" and CLOSURES[callable] then
-		local closure = CLOSURES[callable]
-		local proto = closure.proto
-		local state = create_lua_state(proto, closure.upvals)
+	if typeof(callable) == "userdata" and global_state.closure_protos[callable] then
+		local proto = global_state.closure_protos[callable]
+		local upvals = global_state.closure_upvals[callable]
+		local state = create_lua_state(proto, upvals or {})
 
 		local n = j - i + 1
 
@@ -133,68 +212,38 @@ local function push_stack(global_state: FiOneState, callable: any, i: number, j:
 
 		global_state.stack[stack_level + 1] = state
 		global_state.stack_level = stack_level + 1
+	elseif callable == BASE_ENV.pcall then
+		if j < i then
+			error("missing argument #1")
+		end
+		callable = last_state.memory[i]
+		global_state.stack[stack_level + 1] = {
+			external = true :: true,
+			is_pcall = true :: true,
+			memory = last_state.memory,
+		}
+		global_state.stack_level = stack_level + 1
+		push_stack(global_state, callable, i + 1, j)
 	else
 		local ret_list = table.pack(callable(table.unpack(last_state.memory, i, j)))
 
-		local ret_num = ret_list.n
-
-		local A = last_state.prev_A
-		local C = last_state.prev_C
-
-		if C == 0 then
-			last_state.top_index = A + ret_num - 1
-		else
-			ret_num = C - 1
-		end
-
-		table.move(ret_list, 1, ret_num, A, last_state.memory)
-
-		last_state.pc += 1
+		pop_stack(global_state, ret_list, 1, ret_list.n, true)
 	end
 end
 
-local function pop_stack(global_state: FiOneState, i: number, j: number)
+local function end_closure(global_state: FiOneState, i: number, j: number)
 	local stack_level = global_state.stack_level
-	local last_state = global_state.stack[stack_level]
+	local last_state_memory = global_state.stack[stack_level].memory
 	global_state.stack[stack_level] = nil
-	local last_state_memory = last_state.memory
-
-	local ret_num = j - i + 1
-
-	if stack_level == 1 then
-		local ret = table.create(ret_num)
-		table.move(last_state_memory, i, j, 1, ret)
-		global_state.returned = ret
-		return
-	end
-
-	local prev_state = global_state.stack[stack_level - 1]
-
-	while prev_state.is_tailcall do
-		stack_level -= 1
-		global_state.stack[stack_level] = nil
-		prev_state = global_state.stack[stack_level - 1]
-	end
-
-	local prev_state_memory = prev_state.memory
-	local A = prev_state.prev_A
-	local C = prev_state.prev_C
-
-	if C == 0 then
-		prev_state.top_index = A + ret_num - 1
-	else
-		ret_num = C - 1
-	end
-
-	table.move(last_state_memory, i, i + ret_num, A, prev_state_memory)
-
-	prev_state.pc += 1
 	global_state.stack_level = stack_level - 1
+
+	pop_stack(global_state, last_state_memory, i, j, false)
 end
 
-local function step_lua_func(global_state: FiOneState)
+local function step_lua_func(global_state: FiOneState): ()
+	last_running_state = global_state
 	local stack_level = global_state.stack_level
-	local state = global_state.stack[stack_level]
+	local state = global_state.stack[stack_level] :: LuaState
 
 	local env = global_state.env
 
@@ -304,7 +353,6 @@ local function step_lua_func(global_state: FiOneState)
 						--[[CALL]]
 						local A = inst.A
 						local B = inst.B
-						local C = inst.C
 						local params
 
 						if B == 0 then
@@ -313,8 +361,6 @@ local function step_lua_func(global_state: FiOneState)
 							params = B - 1
 						end
 
-						state.prev_A = A
-						state.prev_C = C
 						push_stack(global_state, memory[A], A + 1, A + params)
 						return
 					else
@@ -443,7 +489,7 @@ local function step_lua_func(global_state: FiOneState)
 						end
 
 						close_lua_upvalues(open_list, 0)
-						pop_stack(global_state, A, A + len - 1)
+						end_closure(global_state, A, A + len - 1)
 						return
 					else
 						--[[CONCAT]]
@@ -599,7 +645,8 @@ local function step_lua_func(global_state: FiOneState)
 						end
 
 						local proxy = newproxy(false)
-						CLOSURES[proxy] = { proto = sub, upvals = uvlist or {} }
+						global_state.closure_protos[proxy] = sub
+						global_state.closure_upvals[proxy] = uvlist
 
 						memory[inst.A] = proxy
 					else
@@ -700,16 +747,55 @@ local function step_lua_func(global_state: FiOneState)
 	state.pc = pc
 end
 
+local function step_state(global_state: FiOneState)
+	local success: boolean, msg: string = pcall(step_lua_func :: any, global_state)
+
+	if not success then
+		local stack_level = global_state.stack_level
+		local last_state
+
+		local stack_trace = ""
+
+		repeat
+			last_state = global_state.stack[stack_level]
+			if not last_state.external then
+				stack_trace ..= `Script '{global_state.source}', Line {last_state.lines[last_state.pc] or "?"}`
+			end
+			global_state.stack[stack_level] = nil
+			stack_level -= 1
+		until (last_state.external and last_state.is_pcall) or stack_level == 0
+
+		global_state.stack_level = stack_level
+
+		pop_stack(global_state, { false, msg, stack_trace }, 1, 3, true)
+	end
+end
+
 local function create_fione_state(proto: parser.Proto, env: { [string]: any }): FiOneState
 	return {
-		env = env,
+		source = proto.source,
+		env = setmetatable(table.clone(env), { __index = BASE_ENV }),
 		stack_level = 1,
-		stack = { create_lua_state(proto, {}) },
+		closure_protos = setmetatable({}, { __mode = "k" }) :: any,
+		closure_upvals = setmetatable({}, { __mode = "k" }) :: any,
+		stack = {
+			-- Used for catching return values at the end of vm execution
+			[0] = {
+				external = false,
+				is_tailcall = false,
+				top_index = -1,
+				memory = {},
+				code = { { A = 1, C = 0 } },
+				pc = 1,
+			} :: any,
+			create_lua_state(proto, {}),
+		},
 	}
 end
 
 return {
+	BASE_ENV = BASE_ENV,
 	create_fione_state = create_fione_state,
 	create_lua_state = create_lua_state,
-	step_lua_func = step_lua_func,
+	step_state = step_state,
 }
